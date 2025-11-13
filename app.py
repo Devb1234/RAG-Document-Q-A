@@ -1,123 +1,103 @@
 import streamlit as st
 import os
-from dotenv import load_dotenv
+import ssl
 
-# ==== Load environment ====
+# ---- FIX SSL Certificate Errors (Corporate Networks, Windows) ----
+os.environ["CURL_CA_BUNDLE"] = ""
+os.environ["REQUESTS_CA_BUNDLE"] = ""
+ssl._create_default_https_context = ssl._create_unverified_context
+
+# ------------------ IMPORTS --------------------
+from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings     # ✅ UPDATED
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_classic.chains import create_retrieval_chain
+from langchain_community.vectorstores import FAISS
+from langchain_community.document_loaders import PyPDFDirectoryLoader
+
+from dotenv import load_dotenv
 load_dotenv()
 
-# Remove broken SSL cert env
-for var in ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"]:
-    if var in os.environ:
-        del os.environ[var]
+# ------------------ API KEYS --------------------
+os.environ['OPENAI_API_KEY'] = os.getenv("OPENAI_API_KEY")
+os.environ['GROQ_API_KEY'] = os.getenv("GROQ_API_KEY")
 
-# ==== LangChain Imports ====
-from langchain_groq import ChatGroq
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.documents import Document
+groq_api_key = os.getenv("GROQ_API_KEY")
 
-from langchain_classic.chains.combine_documents import create_stuff_documents_chain
-from langchain_classic.chains import create_retrieval_chain
-
-from pypdf import PdfReader
-
-
-# ==== Streamlit UI ====
-st.set_page_config(page_title="RAG Q&A", page_icon="📄")
-st.header("📄 RAG Document Q&A System")
-
-
-# ==== API Key Check ====
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    st.error("No GROQ_API_KEY found!")
-    st.stop()
-
-
-# ==== LLM ====
+# ------------------ LLM --------------------
 llm = ChatGroq(
-    model="llama-3.3-70b-versatile",
-    temperature=0
+    groq_api_key=groq_api_key,
+    model_name="llama-3.1-8b-instant"
 )
 
+# ------------------ PROMPT TEMPLATE --------------------
+prompt = ChatPromptTemplate.from_template("""
+Answer the questions based on the provided context only.
+Provide the most accurate response.
 
-# ==== Embeddings ====
-embedding_model = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
+<context>
+{context}
+</context>
 
+Question: {input}
+""")
 
-# ==== File Upload ====
-uploaded_files = st.file_uploader(
-    "Upload PDF / Text files",
-    type=["pdf", "txt"],
-    accept_multiple_files=True
-)
+# ------------------ Create Vector Embeddings --------------------
+def create_vector_embedding():
+    if "vectors" not in st.session_state:
 
-query = st.text_input("Enter your question:")
+        # ✅ Updated embedding class + explicit model
+        st.session_state.embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
 
+        st.session_state.loader = PyPDFDirectoryLoader("research_papers")
+        st.session_state.docs = st.session_state.loader.load()
 
-# ==== Load & Index Documents ====
-def process_docs(uploaded):
-    text = ""
-    for f in uploaded:
-        if f.name.endswith(".txt"):
-            text += f.read().decode("utf-8")
-        elif f.name.endswith(".pdf"):
-            pdf = PdfReader(f)
-            for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text
+        st.session_state.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200
+        )
 
-    if not text.strip():
-        st.error("❌ No readable text found in uploaded files")
-        return None
+        st.session_state.final_documents = st.session_state.text_splitter.split_documents(
+            st.session_state.docs[:50]
+        )
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    docs = [Document(page_content=c) for c in splitter.split_text(text)]
+        st.session_state.vectors = FAISS.from_documents(
+            st.session_state.final_documents,
+            st.session_state.embeddings
+        )
 
-    vs = FAISS.from_documents(docs, embedding_model)
-    return vs
+# ------------------ UI --------------------
+st.title("RAG Document Q&A With Groq and Llama3")
 
+user_prompt = st.text_input("Enter your query from the research paper")
 
-vectorstore = None
-if uploaded_files:
-    vectorstore = process_docs(uploaded_files)
-    if vectorstore:
-        st.success("✅ Documents indexed successfully!")
+if st.button("Document Embedding"):
+    create_vector_embedding()
+    st.success("Vector Database is ready!")
 
+import time
 
-# ==== RAG ====
-if query:
-    if not vectorstore:
-        st.warning("Upload documents first!")
+# ------------------ Query Handling --------------------
+if user_prompt:
+    if "vectors" not in st.session_state:
+        st.warning("Please click 'Document Embedding' first.")
     else:
-        retriever = vectorstore.as_retriever()
+        document_chain = create_stuff_documents_chain(llm, prompt)
+        retriever = st.session_state.vectors.as_retriever()
+        retrieval_chain = create_retrieval_chain(retriever, document_chain)
 
-        prompt = ChatPromptTemplate.from_template("""
-        Use the following documents to answer the question.
-        If answer is not found, say 'I don't know'.
+        start = time.process_time()
+        response = retrieval_chain.invoke({'input': user_prompt})
+        st.write(f"Response time: {time.process_time() - start:.2f}s")
 
-        Documents:
-        {context}
+        st.subheader("Answer")
+        st.write(response['answer'])
 
-        Question: {input}
-        """)
-
-        combine_chain = create_stuff_documents_chain(
-            llm=llm,
-            prompt=prompt
-        )
-
-        rag_chain = create_retrieval_chain(
-            retriever,
-            combine_chain
-        )
-
-        response = rag_chain.invoke({"input": query})
-
-        st.write("### ✅ Answer")
-        st.write(response.get("answer", "No answer found"))
+        with st.expander("Document similarity search"):
+            for i, doc in enumerate(response['context']):
+                st.write(doc.page_content)
+                st.write("---")
